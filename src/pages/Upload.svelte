@@ -1,7 +1,7 @@
 <script lang="ts">
   import Card from '$lib/components/ui/card.svelte'
   import Badge from '$lib/components/ui/badge.svelte'
-  import { File as FileIcon, X, Plus, FolderOpen, FileText, Image, Music, Video, Archive, Code, FileSpreadsheet, Zap, Upload, Download, RefreshCw } from 'lucide-svelte'
+  import { File as FileIcon, X, Plus, FolderOpen, FileText, Image, Music, Video, Archive, Code, FileSpreadsheet, Upload, Download, RefreshCw } from 'lucide-svelte'
   import { files } from '$lib/stores'
   import { t } from 'svelte-i18n';
   import { get } from 'svelte/store'
@@ -160,14 +160,13 @@
     let addedCount = 0
 
     for (let i = 0; i < filesToAdd.length; i++) {
-      const file = filesToAdd[i];
+      const file = filesToAdd[i]
       try {
-        // Mock upload for demo purposes (backend not available)
-        const fileHash = `mock-hash-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        const fileHash = await fileService.uploadFile(file)
 
         if (isDuplicateHash(get(files), fileHash)) {
           duplicateCount++
-          continue;
+          continue
         }
 
         const newFile = {
@@ -176,16 +175,19 @@
           hash: fileHash,
           size: file.size,
           status: 'seeding' as const,
-          seeders: Math.floor(Math.random() * 10) + 1,
-          leechers: Math.floor(Math.random() * 5),
+          seeders: 1,
+          leechers: 0,
           uploadDate: new Date()
-        };
+        }
 
-        files.update(f => [...f, newFile]);
-        addedCount++;
+        files.update(f => [...f, newFile])
+        addedCount++
       } catch (error) {
-        console.error(`Failed to upload file "${file.name}":`, error);
-        showToast(tr('upload.fileFailed', { values: { name: file.name, error: String(error) } }), 'error');
+        console.error(`Failed to upload file "${file.name}":`, error)
+        showToast(
+          tr('upload.fileFailed', { values: { name: file.name, error: String(error) } }),
+          'error'
+        )
       }
     }
 
@@ -195,7 +197,7 @@
 
     if (addedCount > 0) {
       showToast(tr('upload.filesAdded', { values: { count: addedCount } }), 'success')
-      refreshAvailableStorage()
+      await refreshAvailableStorage()
     }
   }
   

@@ -111,35 +111,7 @@ export interface BlacklistEntry {
 }
 
 // Sample dummy data
-const dummyFiles: FileItem[] = [
-  {
-    id: "0",
-    name: "Video.mp4",
-    hash: "QmZ4tDuvesekqMF",
-    size: 50331648,
-    status: "paused",
-    progress: 30,
-    visualOrder: 1,
-  },
-  {
-    id: "1",
-    name: "Document.pdf",
-    hash: "QmZ4tDuvesekqMD",
-    size: 2048576,
-    status: "completed",
-    progress: 100,
-    visualOrder: 2,
-  },
-  {
-    id: "2",
-    name: "Archive.zip",
-    hash: "QmZ4tDuvesekqMG",
-    size: 10485760,
-    status: "uploaded",
-    progress: 100,
-    visualOrder: 3,
-  },
-];
+const dummyFiles: FileItem[] = [];
 
 const dummyProxyNodes: ProxyNode[] = [
   {

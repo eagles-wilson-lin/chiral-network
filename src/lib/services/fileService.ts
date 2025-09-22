@@ -64,9 +64,9 @@ export class FileService {
    * @param fileName The name to save the file as.
    * @returns The full path to the downloaded file.
    */
-  async downloadFile(hash: string, fileName: string): Promise<string> {
+  async downloadFile(hash: string, fileName: string, destinationPath?: string): Promise<string> {
     const downloadPath = await downloadDir();
-    const outputPath = await join(downloadPath, fileName);
+    const outputPath = destinationPath ?? (await join(downloadPath, fileName));
 
     // Calls 'download_file_from_network' on the backend.
     // Note: The current backend implementation only retrieves from its local
