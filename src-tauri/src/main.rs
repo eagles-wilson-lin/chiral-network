@@ -559,14 +559,9 @@ async fn upload_file_to_network(
     };
 
     if let Some(ft) = ft {
-        // Upload the file
-        ft.upload_file(file_path.clone(), file_name.clone()).await?;
-
-        // Get the file hash by reading the file and calculating it
-        let file_data = tokio::fs::read(&file_path)
-            .await
-            .map_err(|e| format!("Failed to read file: {}", e))?;
-        let file_hash = file_transfer::FileTransferService::calculate_file_hash(&file_data);
+        let file_hash = ft
+            .upload_file(file_path.clone(), file_name.clone())
+            .await?;
 
         // Also publish to DHT if it's running
         let dht = {
@@ -645,13 +640,10 @@ async fn upload_file_data_to_network(
     };
 
     if let Some(ft) = ft {
-        // Calculate file hash from the data
-        let file_hash = file_transfer::FileTransferService::calculate_file_hash(&file_data);
-
-        // Store the file data directly in memory
         let file_size = file_data.len() as u64;
-        ft.store_file_data(file_hash.clone(), file_name.clone(), file_data)
-            .await;
+        let file_hash = ft
+            .store_file_data(file_name.clone(), file_data)
+            .await?;
 
         // Also publish to DHT if it's running
         let dht = {

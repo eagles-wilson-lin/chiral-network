@@ -15,7 +15,6 @@
   } from 'lucide-svelte'
   import { t } from 'svelte-i18n'
   import { get } from 'svelte/store'
-  import { showToast } from '$lib/toast'
 
   const tr = (k: string, params?: Record<string, any>) => get(t)(k, params)
 
@@ -181,24 +180,24 @@
 
         <!-- Filters -->
         <div class="flex gap-2">
-          <DropDown
-            options={statusOptions}
-            bind:value={statusFilter}
-            placeholder="Status"
-            class="min-w-[120px]"
-          />
-          <DropDown
-            options={typeOptions}
-            bind:value={typeFilter}
-            placeholder="Type"
-            class="min-w-[120px]"
-          />
-          <DropDown
-            options={sortOptions}
-            bind:value={sortBy}
-            placeholder="Sort by"
-            class="min-w-[120px]"
-          />
+          <div class="min-w-[120px]">
+            <DropDown
+              options={statusOptions}
+              bind:value={statusFilter}
+            />
+          </div>
+          <div class="min-w-[120px]">
+            <DropDown
+              options={typeOptions}
+              bind:value={typeFilter}
+            />
+          </div>
+          <div class="min-w-[120px]">
+            <DropDown
+              options={sortOptions}
+              bind:value={sortBy}
+            />
+          </div>
           <Button
             variant="outline"
             size="sm"
@@ -234,18 +233,18 @@
       </Card>
     {:else}
       {#each filteredTransactions as tx (tx.id)}
-        <Card 
-          class="p-4 hover:bg-gray-50 dark:hover:bg-gray-800/50 cursor-pointer transition-colors"
-          on:click={() => handleTransactionClick(tx)}
-          on:keydown={(e) => {
-            if (e.key === 'Enter') {
-              handleTransactionClick(tx)
-            }
-          }}
-          role="button"
-          tabindex="0"
-        >
-          <div class="flex items-center justify-between">
+        <Card class="p-4 transition-colors">
+          <div
+            class="flex items-center justify-between cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/50"
+            role="button"
+            tabindex="0"
+            on:click={() => handleTransactionClick(tx)}
+            on:keydown={(event: KeyboardEvent) => {
+              if (event.key === 'Enter') {
+                handleTransactionClick(tx)
+              }
+            }}
+          >
             <!-- Left side: Type, Description, Address -->
             <div class="flex items-center space-x-3 flex-1 min-w-0">
               <!-- Type Icon -->
