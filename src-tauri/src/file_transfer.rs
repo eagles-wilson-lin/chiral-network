@@ -319,9 +319,7 @@ impl FileTransferState {
     async fn assemble_file(&self, file_hash: &str, output_path: &Path) -> Result<(), String> {
         let manifest = {
             let guard = self.stored_files.lock().await;
-            guard
-                .get(file_hash)
-                .cloned()
+            guard.get(file_hash).cloned()
         }
         .ok_or_else(|| "File not found locally".to_string())?;
 
@@ -405,7 +403,11 @@ impl FileTransferService {
         });
 
         // Spawn the file transfer service task
-        tokio::spawn(Self::run_file_transfer_service(cmd_rx, event_tx, state.clone()));
+        tokio::spawn(Self::run_file_transfer_service(
+            cmd_rx,
+            event_tx,
+            state.clone(),
+        ));
 
         Ok(FileTransferService {
             cmd_tx,
@@ -414,7 +416,9 @@ impl FileTransferService {
         })
     }
 
-    async fn load_existing_manifests(manifests_dir: &Path) -> Result<HashMap<String, StoredFile>, String> {
+    async fn load_existing_manifests(
+        manifests_dir: &Path,
+    ) -> Result<HashMap<String, StoredFile>, String> {
         let mut stored_files = HashMap::new();
 
         let mut entries = match fs::read_dir(manifests_dir).await {
@@ -498,7 +502,8 @@ impl FileTransferService {
                     output_path,
                     respond_to,
                 } => {
-                    match Self::handle_download_file(&file_hash, &output_path, state.clone()).await {
+                    match Self::handle_download_file(&file_hash, &output_path, state.clone()).await
+                    {
                         Ok(()) => {
                             let _ = respond_to.send(Ok(()));
                             let _ = event_tx
@@ -536,9 +541,7 @@ impl FileTransferService {
         file_name: &str,
         state: Arc<FileTransferState>,
     ) -> Result<String, String> {
-        state
-            .store_from_path(Path::new(file_path), file_name)
-            .await
+        state.store_from_path(Path::new(file_path), file_name).await
     }
 
     async fn handle_download_file(
@@ -546,9 +549,7 @@ impl FileTransferService {
         output_path: &str,
         state: Arc<FileTransferState>,
     ) -> Result<(), String> {
-        state
-            .assemble_file(file_hash, Path::new(output_path))
-            .await
+        state.assemble_file(file_hash, Path::new(output_path)).await
     }
 
     pub fn calculate_file_hash(data: &[u8]) -> String {
@@ -557,7 +558,11 @@ impl FileTransferService {
         format!("{:x}", hasher.finalize())
     }
 
-    pub async fn upload_file(&self, file_path: String, file_name: String) -> Result<String, String> {
+    pub async fn upload_file(
+        &self,
+        file_path: String,
+        file_name: String,
+    ) -> Result<String, String> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(FileTransferCommand::UploadFile {
@@ -609,7 +614,11 @@ impl FileTransferService {
         events
     }
 
-    pub async fn store_file_data(&self, file_name: String, file_data: Vec<u8>) -> Result<String, String> {
+    pub async fn store_file_data(
+        &self,
+        file_name: String,
+        file_data: Vec<u8>,
+    ) -> Result<String, String> {
         self.state.store_from_bytes(&file_name, &file_data).await
     }
 }

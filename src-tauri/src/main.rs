@@ -559,9 +559,7 @@ async fn upload_file_to_network(
     };
 
     if let Some(ft) = ft {
-        let file_hash = ft
-            .upload_file(file_path.clone(), file_name.clone())
-            .await?;
+        let file_hash = ft.upload_file(file_path.clone(), file_name.clone()).await?;
 
         // Also publish to DHT if it's running
         let dht = {
@@ -641,9 +639,7 @@ async fn upload_file_data_to_network(
 
     if let Some(ft) = ft {
         let file_size = file_data.len() as u64;
-        let file_hash = ft
-            .store_file_data(file_name.clone(), file_data)
-            .await?;
+        let file_hash = ft.store_file_data(file_name.clone(), file_data).await?;
 
         // Also publish to DHT if it's running
         let dht = {

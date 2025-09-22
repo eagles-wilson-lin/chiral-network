@@ -17,7 +17,10 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{
+    mpsc::{self, error::TrySendError},
+    oneshot, Mutex,
+};
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,8 +103,24 @@ impl DhtMetricsSnapshot {
 impl DhtMetrics {
     fn record_listen_addr(&mut self, addr: &Multiaddr) {
         let addr_str = addr.to_string();
-        if !self.listen_addrs.iter().any(|existing| existing == &addr_str) {
+        if !self
+            .listen_addrs
+            .iter()
+            .any(|existing| existing == &addr_str)
+        {
             self.listen_addrs.push(addr_str);
+        }
+    }
+}
+
+fn emit_event(event_tx: &mpsc::Sender<DhtEvent>, event: DhtEvent) {
+    match event_tx.try_send(event) {
+        Ok(()) => {}
+        Err(TrySendError::Full(event)) => {
+            warn!(?event, "Dropping DHT event because the queue is full");
+        }
+        Err(TrySendError::Closed(event)) => {
+            debug!(?event, "Dropping DHT event because the receiver closed");
         }
     }
 }
@@ -153,13 +172,19 @@ async fn run_dht_node(
                                     }
                                     Err(e) => {
                                         error!("Failed to publish file metadata {}: {}", metadata.file_hash, e);
-                                        let _ = event_tx.send(DhtEvent::Error(format!("Failed to publish: {}", e))).await;
+                                        emit_event(
+                                            &event_tx,
+                                            DhtEvent::Error(format!("Failed to publish: {}", e)),
+                                        );
                                     }
                                 }
                             }
                             Err(e) => {
                                 error!("Failed to serialize file metadata {}: {}", metadata.file_hash, e);
-                                let _ = event_tx.send(DhtEvent::Error(format!("Failed to serialize metadata: {}", e))).await;
+                                emit_event(
+                                    &event_tx,
+                                    DhtEvent::Error(format!("Failed to serialize metadata: {}", e)),
+                                );
                             }
                         }
                     }
@@ -179,12 +204,18 @@ async fn run_dht_node(
                                 }
                                 Err(e) => {
                                     error!("✗ Failed to dial {}: {}", addr, e);
-                                    let _ = event_tx.send(DhtEvent::Error(format!("Failed to connect: {}", e))).await;
+                                    emit_event(
+                                        &event_tx,
+                                        DhtEvent::Error(format!("Failed to connect: {}", e)),
+                                    );
                                 }
                             }
                         } else {
                             error!("✗ Invalid multiaddr format: {}", addr);
-                            let _ = event_tx.send(DhtEvent::Error(format!("Invalid address: {}", addr))).await;
+                            emit_event(
+                                &event_tx,
+                                DhtEvent::Error(format!("Invalid address: {}", addr)),
+                            );
                         }
                     }
                     Some(DhtCommand::GetPeerCount(tx)) => {
@@ -225,7 +256,7 @@ async fn run_dht_node(
                             m.last_success = Some(SystemTime::now());
                         }
                         info!("   Total connected peers: {}", peers_count);
-                        let _ = event_tx.send(DhtEvent::PeerConnected(peer_id.to_string())).await;
+                        emit_event(&event_tx, DhtEvent::PeerConnected(peer_id.to_string()));
                     }
                     SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                         warn!("❌ DISCONNECTED from peer: {}", peer_id);
@@ -236,7 +267,7 @@ async fn run_dht_node(
                             peers.len()
                         };
                         info!("   Remaining connected peers: {}", peers_count);
-                        let _ = event_tx.send(DhtEvent::PeerDisconnected(peer_id.to_string())).await;
+                        emit_event(&event_tx, DhtEvent::PeerDisconnected(peer_id.to_string()));
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
                         info!("📡 Now listening on: {}", address);
@@ -265,7 +296,7 @@ async fn run_dht_node(
                         } else {
                             error!("❌ Outgoing connection error to unknown peer: {}", error);
                         }
-                        let _ = event_tx.send(DhtEvent::Error(format!("Connection failed: {}", error))).await;
+                        emit_event(&event_tx, DhtEvent::Error(format!("Connection failed: {}", error)));
                     }
                     SwarmEvent::IncomingConnectionError { error, .. } => {
                         if let Ok(mut m) = metrics.try_lock() {
@@ -310,7 +341,7 @@ async fn handle_kademlia_event(event: KademliaEvent, event_tx: &mpsc::Sender<Dht
                         if let Ok(metadata) =
                             serde_json::from_slice::<FileMetadata>(&peer_record.record.value)
                         {
-                            let _ = event_tx.send(DhtEvent::FileDiscovered(metadata)).await;
+                            emit_event(&event_tx, DhtEvent::FileDiscovered(metadata));
                         } else {
                             debug!("Received non-file metadata record");
                         }
@@ -324,7 +355,7 @@ async fn handle_kademlia_event(event: KademliaEvent, event_tx: &mpsc::Sender<Dht
                     // If the error includes the key, emit FileNotFound
                     if let kad::GetRecordError::NotFound { key, .. } = err {
                         let file_hash = String::from_utf8_lossy(key.as_ref()).to_string();
-                        let _ = event_tx.send(DhtEvent::FileNotFound(file_hash)).await;
+                        emit_event(&event_tx, DhtEvent::FileNotFound(file_hash));
                     }
                 }
                 QueryResult::PutRecord(Ok(PutRecordOk { key })) => {
@@ -332,9 +363,10 @@ async fn handle_kademlia_event(event: KademliaEvent, event_tx: &mpsc::Sender<Dht
                 }
                 QueryResult::PutRecord(Err(err)) => {
                     warn!("PutRecord error: {:?}", err);
-                    let _ = event_tx
-                        .send(DhtEvent::Error(format!("PutRecord failed: {:?}", err)))
-                        .await;
+                    emit_event(
+                        &event_tx,
+                        DhtEvent::Error(format!("PutRecord failed: {:?}", err)),
+                    );
                 }
                 _ => {}
             }
@@ -376,9 +408,7 @@ async fn handle_mdns_event(
                     .behaviour_mut()
                     .kademlia
                     .add_address(&peer_id, multiaddr);
-                let _ = event_tx
-                    .send(DhtEvent::PeerDiscovered(peer_id.to_string()))
-                    .await;
+                emit_event(&event_tx, DhtEvent::PeerDiscovered(peer_id.to_string()));
             }
         }
         MdnsEvent::Expired(list) => {
@@ -657,13 +687,10 @@ mod tests {
     #[test]
     fn metrics_snapshot_carries_listen_addrs() {
         let mut metrics = DhtMetrics::default();
-        metrics
-            .record_listen_addr(&"/ip4/127.0.0.1/tcp/4001".parse::<Multiaddr>().unwrap());
-        metrics
-            .record_listen_addr(&"/ip4/0.0.0.0/tcp/4001".parse::<Multiaddr>().unwrap());
+        metrics.record_listen_addr(&"/ip4/127.0.0.1/tcp/4001".parse::<Multiaddr>().unwrap());
+        metrics.record_listen_addr(&"/ip4/0.0.0.0/tcp/4001".parse::<Multiaddr>().unwrap());
         // Duplicate should be ignored
-        metrics
-            .record_listen_addr(&"/ip4/127.0.0.1/tcp/4001".parse::<Multiaddr>().unwrap());
+        metrics.record_listen_addr(&"/ip4/127.0.0.1/tcp/4001".parse::<Multiaddr>().unwrap());
 
         let snapshot = DhtMetricsSnapshot::from(metrics, 5);
         assert_eq!(snapshot.peer_count, 5);
