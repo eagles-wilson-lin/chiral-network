@@ -18,7 +18,6 @@
 mod relay_auth;
 use relay_auth::*;
 
-
 use anyhow::Result;
 use clap::Parser;
 use futures::StreamExt;
@@ -26,16 +25,19 @@ use libp2p::{
     autonat, identify, identity,
     multiaddr::Protocol,
     noise, ping, relay,
+    request_response::{
+        Behaviour as RequestResponse, Config as RequestResponseConfig,
+        Event as RequestResponseEvent, Message as RequestResponseMessage, ProtocolSupport,
+    },
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId,
-    request_response::{Behaviour as RequestResponse, Config as RequestResponseConfig, Event as RequestResponseEvent, ProtocolSupport, Message as RequestResponseMessage},
 };
 use std::{
+    collections::HashSet,
     net::Ipv4Addr,
     path::PathBuf,
-    time::Duration,
-    collections::{HashSet},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -88,16 +90,24 @@ enum RelayBehaviourEvent {
     RelayAuth(RequestResponseEvent<RelayAuthRequest, RelayAuthResponse>),
 }
 impl From<relay::Event> for RelayBehaviourEvent {
-    fn from(e: relay::Event) -> Self { RelayBehaviourEvent::Relay(e) }
+    fn from(e: relay::Event) -> Self {
+        RelayBehaviourEvent::Relay(e)
+    }
 }
 impl From<ping::Event> for RelayBehaviourEvent {
-    fn from(e: ping::Event) -> Self { RelayBehaviourEvent::Ping(e) }
+    fn from(e: ping::Event) -> Self {
+        RelayBehaviourEvent::Ping(e)
+    }
 }
 impl From<identify::Event> for RelayBehaviourEvent {
-    fn from(e: identify::Event) -> Self { RelayBehaviourEvent::Identify(e) }
+    fn from(e: identify::Event) -> Self {
+        RelayBehaviourEvent::Identify(e)
+    }
 }
 impl From<autonat::Event> for RelayBehaviourEvent {
-    fn from(e: autonat::Event) -> Self { RelayBehaviourEvent::Autonat(e) }
+    fn from(e: autonat::Event) -> Self {
+        RelayBehaviourEvent::Autonat(e)
+    }
 }
 impl From<RequestResponseEvent<RelayAuthRequest, RelayAuthResponse>> for RelayBehaviourEvent {
     fn from(e: RequestResponseEvent<RelayAuthRequest, RelayAuthResponse>) -> Self {
@@ -133,8 +143,7 @@ async fn main() -> Result<()> {
     let log_level = if args.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(log_level)),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level)),
         )
         .init();
 
@@ -147,7 +156,10 @@ async fn main() -> Result<()> {
             let bytes = std::fs::read(path)?;
             identity::Keypair::from_protobuf_encoding(&bytes)?
         } else {
-            info!("🔑 Generating new identity and saving to {}", path.display());
+            info!(
+                "🔑 Generating new identity and saving to {}",
+                path.display()
+            );
             let keypair = identity::Keypair::generate_ed25519();
             let bytes = keypair.to_protobuf_encoding()?;
             std::fs::write(path, bytes)?;
@@ -170,29 +182,38 @@ async fn main() -> Result<()> {
 
     // === TOKEN SETUP ===
     // Replace with your real tokens!
-    let tokens: HashSet<Vec<u8>> = [
-        b"mysecrettoken1".to_vec(),
-        b"mysecrettoken2".to_vec(),
-    ].iter().cloned().collect();
+    let tokens: HashSet<Vec<u8>> = [b"mysecrettoken1".to_vec(), b"mysecrettoken2".to_vec()]
+        .iter()
+        .cloned()
+        .collect();
     // Track authenticated peers
     let authed_peers: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
 
     // Relay Auth protocol setup
     let relay_auth_protocols = std::iter::once((RelayAuthProtocol(), ProtocolSupport::Full));
-    let relay_auth = RequestResponse::new(
-        relay_auth_protocols,
-        RequestResponseConfig::default(),
-    );
+    let relay_auth = RequestResponse::new(relay_auth_protocols, RequestResponseConfig::default());
 
     // === RELAY CONFIG ===
     // Note: In libp2p 0.54, reservation_handler is not supported
-    // Authentication will be handled at the application level
-    let relay_config = relay::Config {
-        max_reservations_per_peer: args.max_reservations,
-        max_circuits_per_peer: args.max_circuits,
-        max_circuit_duration: Duration::from_secs(3600), // 1 hour
-        ..Default::default()
-    };
+    // Authentication will be handled at the application level using a custom rate limiter.
+    let mut relay_config = relay::Config::default();
+    relay_config.max_reservations = args.max_reservations;
+    relay_config.max_reservations_per_peer = args.max_reservations;
+    relay_config.max_circuits = args.max_circuits;
+    relay_config.max_circuits_per_peer = args.max_circuits;
+    relay_config.max_circuit_duration = Duration::from_secs(3600); // 1 hour
+
+    // Inject an authentication-aware limiter that only allows reservations from peers
+    // who have successfully provided a valid token via the request-response protocol.
+    let authed_peers_for_limiter = authed_peers.clone();
+    relay_config.reservation_rate_limiters.push(Box::new(
+        move |peer_id: PeerId, _addr: &Multiaddr, _now: web_time::Instant| {
+            match authed_peers_for_limiter.lock() {
+                Ok(peers) => peers.contains(&peer_id),
+                Err(_) => false,
+            }
+        },
+    ));
 
     let behaviour = RelayBehaviour {
         relay: relay::Behaviour::new(local_peer_id, relay_config),
@@ -229,10 +250,7 @@ async fn main() -> Result<()> {
     if let Some(external) = args.external_address {
         swarm.add_external_address(external.clone());
         info!("🌐 External address: {}", external);
-        info!(
-            "📋 Full multiaddr: {}/p2p/{}",
-            external, local_peer_id
-        );
+        info!("📋 Full multiaddr: {}/p2p/{}", external, local_peer_id);
     }
 
     let start_time = std::time::Instant::now();
@@ -339,6 +357,10 @@ async fn main() -> Result<()> {
                     }
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
                         connected_peers = connected_peers.saturating_sub(1);
+                        let was_authed = authed_peers.lock().unwrap().remove(&peer_id);
+                        if was_authed {
+                            info!("🔒 Cleared authentication state for disconnected peer: {}", peer_id);
+                        }
                         info!("👋 Connection closed with peer: {} (total: {})", peer_id, connected_peers);
                     }
                     SwarmEvent::IncomingConnectionError { error, .. } => {
