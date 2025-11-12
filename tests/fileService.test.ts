@@ -1,3 +1,4 @@
+import path from "path";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { FileService, fileService } from "../src/lib/services/fileService";
 import { invoke } from "@tauri-apps/api/core";
@@ -8,10 +9,15 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
-vi.mock("@tauri-apps/api/path", () => ({
-  join: vi.fn((...paths) => paths.join("/")),
-  homeDir: vi.fn(),
-}));
+vi.mock("@tauri-apps/api/path", () => {
+  const posix = path.posix;
+  return {
+    join: vi.fn((...paths: string[]) => posix.join(...paths)),
+    normalize: vi.fn((value: string) => posix.normalize(value)),
+    sep: posix.sep,
+    homeDir: vi.fn(),
+  };
+});
 
 // Mock encryption service
 vi.mock("../src/lib/services/encryption", () => ({
@@ -438,22 +444,17 @@ describe("FileService", () => {
     });
 
     it("should reject path traversal attempts", async () => {
-      vi.mocked(invoke)
-        .mockResolvedValueOnce(true)
-        .mockResolvedValueOnce(undefined);
+      vi.mocked(invoke).mockResolvedValueOnce(true);
 
-      await service.downloadFile("QmTest", "../../../etc/passwd");
+      await expect(
+        service.downloadFile("QmTest", "../../../etc/passwd")
+      ).rejects.toThrow(/invalid file name/i);
 
       const calls = vi.mocked(invoke).mock.calls;
-      const downloadCall = calls.find(call => call[0] === "download_file_from_network");
-      expect(downloadCall).toBeDefined();
-      
-      const callArgs = downloadCall![1] as { fileHash: string; outputPath: string };
-      
-      // Current implementation: path traversal is passed through to backend
-      // The backend (Rust) validates and rejects this in check_directory_exists
-      // This test documents current behavior - frontend doesn't sanitize paths
-      expect(callArgs.outputPath).toContain("../../../etc/passwd");
+      const downloadCall = calls.find(
+        call => call[0] === "download_file_from_network"
+      );
+      expect(downloadCall).toBeUndefined();
     });
   });
 
