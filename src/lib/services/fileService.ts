@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { join } from "@tauri-apps/api/path";
+import { join, normalize, sep } from "@tauri-apps/api/path";
 
 /**
  * A service class to interact with the file transfer and DHT commands
@@ -127,18 +127,30 @@ export class FileService {
       );
     }
 
-    // Construct full file path using join for proper path handling
-    const outputPath = await join(storagePath, fileName);
+    // Construct and normalize the full file path
+    const joinedPath = await join(storagePath, fileName);
+    const normalizedStorage = await normalize(storagePath);
+    const normalizedOutput = await normalize(joinedPath);
 
-    console.log("✅ Starting download to:", outputPath);
+    const normalizedStorageWithSep = normalizedStorage.endsWith(sep)
+      ? normalizedStorage
+      : `${normalizedStorage}${sep}`;
+
+    if (!normalizedOutput.startsWith(normalizedStorageWithSep)) {
+      throw new Error(
+        "Invalid file name. Download path must stay within the configured storage directory."
+      );
+    }
+
+    console.log("✅ Starting download to:", normalizedOutput);
 
     // Call the backend with the validated path
     await invoke("download_file_from_network", {
       fileHash: hash,
-      outputPath: outputPath,
+      outputPath: normalizedOutput,
     });
 
-    return outputPath;
+    return normalizedOutput;
   }
 
   /**
