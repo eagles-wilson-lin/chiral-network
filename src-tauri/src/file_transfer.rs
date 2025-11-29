@@ -1,8 +1,7 @@
 use crate::encryption;
 use crate::transfer_events::{
-    TransferEventBus, TransferCompletedEvent, TransferFailedEvent,
-    TransferStartedEvent, SourceInfo, SourceType, SourceSummary, ErrorCategory,
-    current_timestamp_ms,
+    current_timestamp_ms, ErrorCategory, SourceInfo, SourceSummary, SourceType,
+    TransferCompletedEvent, TransferEventBus, TransferFailedEvent, TransferStartedEvent,
 };
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -85,6 +84,19 @@ pub enum AttemptStatus {
     Retrying,
     Success,
     Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ChunkMetadata {
+    pub chunk_index: u32,
+    pub offset: u64,
+    pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Tracks how far into the chunk we've verified for resume safety
+    #[serde(default)]
+    pub last_verified_offset: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -592,17 +604,23 @@ impl FileTransferService {
 
             // Store the encryption key in keystore if we have an active account
             if let (Some(account), Some(private_key)) = (active_account, active_private_key) {
-                match keystore.lock().await.store_file_encryption_key_with_private_key(
-                    account,
-                    original_file_hash.clone(),
-                    &encryption_key,
-                    private_key,
-                ) {
+                match keystore
+                    .lock()
+                    .await
+                    .store_file_encryption_key_with_private_key(
+                        account,
+                        original_file_hash.clone(),
+                        &encryption_key,
+                        private_key,
+                    ) {
                     Ok(_) => {
                         info!("✅ Stored encryption key for file: {}", original_file_hash);
                     }
                     Err(e) => {
-                        warn!("⚠️  Failed to store encryption key (continuing anyway): {}", e);
+                        warn!(
+                            "⚠️  Failed to store encryption key (continuing anyway): {}",
+                            e
+                        );
                         // Don't fail the upload - encryption key storage is optional for testing
                     }
                 }

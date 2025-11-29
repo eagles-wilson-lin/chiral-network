@@ -1,12 +1,13 @@
 use crate::transfer_events::{
-    calculate_eta, calculate_progress, current_timestamp_ms, ChunkCompletedEvent,
-    SourceConnectedEvent, SourceDisconnectedEvent, SourceInfo, SourceType,
-    TransferCompletedEvent, TransferEventBus, TransferFailedEvent, TransferPriority,
-    TransferProgressEvent, TransferStartedEvent, DisconnectReason,
-    ErrorCategory, SourceSummary,
+    calculate_eta, calculate_progress, current_timestamp_ms, ChunkCompletedEvent, DisconnectReason,
+    ErrorCategory, SourceConnectedEvent, SourceDisconnectedEvent, SourceInfo, SourceSummary,
+    SourceType, TransferCompletedEvent, TransferEventBus, TransferFailedEvent, TransferPriority,
+    TransferProgressEvent, TransferStartedEvent,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -61,6 +62,8 @@ pub struct HttpFileMetadata {
     pub name: String,
     pub size: u64,
     pub encrypted: bool,
+    #[serde(default)]
+    pub chunk_hashes: Vec<String>,
 }
 
 /// Represents a byte range to download
@@ -176,7 +179,9 @@ impl HttpDownloadClient {
 
     /// Get the event bus if app handle is available
     fn get_event_bus(&self) -> Option<TransferEventBus> {
-        self.app_handle.as_ref().map(|h| TransferEventBus::new(h.clone()))
+        self.app_handle
+            .as_ref()
+            .map(|h| TransferEventBus::new(h.clone()))
     }
 
     /// Download a file from an HTTP seeder using Range requests
@@ -260,6 +265,11 @@ impl HttpDownloadClient {
                 &ranges,
                 progress_tx.clone(),
                 metadata.size,
+                if metadata.chunk_hashes.is_empty() {
+                    None
+                } else {
+                    Some(metadata.chunk_hashes.as_slice())
+                },
             )
             .await?;
 
@@ -445,6 +455,11 @@ impl HttpDownloadClient {
                 event_bus.clone(),
                 &source_id,
                 start_time,
+                if metadata.chunk_hashes.is_empty() {
+                    None
+                } else {
+                    Some(metadata.chunk_hashes.as_slice())
+                },
             )
             .await;
 
@@ -583,174 +598,243 @@ impl HttpDownloadClient {
         event_bus: Option<TransferEventBus>,
         source_id: &str,
         start_time: Instant,
+        expected_hashes: Option<&[String]>,
     ) -> Result<Vec<Vec<u8>>, String> {
-        let mut tasks = Vec::new();
         let completed_bytes = std::sync::Arc::new(AtomicU64::new(0));
         let completed_chunks = std::sync::Arc::new(AtomicU64::new(0));
+        let mut pending: VecDeque<ByteRange> = ranges.to_vec().into();
+        let mut attempts: HashMap<usize, u8> = HashMap::new();
+        let mut results: HashMap<usize, (Vec<u8>, u64)> = HashMap::new();
+        let range_lookup: HashMap<usize, ByteRange> =
+            ranges.iter().map(|r| (r.index, r.clone())).collect();
 
-        for range in ranges {
-            let client = self.http_client.clone();
-            let url = format!("{}/files/{}", seeder_url, file_hash);
-            let start = range.start;
-            let end = range.end;
-            let index = range.index;
-            let progress_tx = progress_tx.clone();
-            let file_hash = file_hash.to_string();
-            let total_chunks = ranges.len();
-            let semaphore = self.download_semaphore.clone();
-            let downloader_peer_id = self.downloader_peer_id.clone();
-            let event_bus = event_bus.clone();
-            let config = config.clone();
-            let source_id = source_id.to_string();
-            let completed_bytes = completed_bytes.clone();
-            let completed_chunks = completed_chunks.clone();
-            let start_time = start_time;
-
-            let task = tokio::spawn(async move {
-                let chunk_start_time = Instant::now();
-
-                // Acquire permit (waits if MAX_CONCURRENT_CHUNKS already downloading)
-                let _permit = semaphore
-                    .acquire()
-                    .await
-                    .map_err(|e| format!("Failed to acquire semaphore: {}", e))?;
-
-                tracing::debug!(
-                    "Downloading chunk {} (bytes {}-{}) from {}",
-                    index,
-                    start,
-                    end,
-                    url
-                );
-
-                // Make request with Range header and optional peer ID
-                let mut request = client
-                    .get(&url)
-                    .header("Range", format!("bytes={}-{}", start, end));
-
-                if let Some(ref peer_id) = downloader_peer_id {
-                    request = request.header("X-Downloader-Peer-ID", peer_id);
+        while let Some(first) = pending.pop_front() {
+            let mut batch = vec![first];
+            while batch.len() < MAX_CONCURRENT_CHUNKS {
+                if let Some(next) = pending.pop_front() {
+                    batch.push(next);
+                } else {
+                    break;
                 }
+            }
 
-                let response = request.send().await.map_err(|e| format!("Failed to download chunk {}: {}", index, e))?;
+            let mut handles = Vec::new();
+            for range in batch {
+                let client = self.http_client.clone();
+                let url = format!("{}/files/{}", seeder_url, file_hash);
+                let start = range.start;
+                let end = range.end;
+                let index = range.index;
+                let progress_tx = progress_tx.clone();
+                let file_hash = file_hash.to_string();
+                let total_chunks = ranges.len();
+                let semaphore = self.download_semaphore.clone();
+                let downloader_peer_id = self.downloader_peer_id.clone();
+                let event_bus = event_bus.clone();
+                let config = config.clone();
+                let source_id = source_id.to_string();
+                let completed_bytes = completed_bytes.clone();
+                let completed_chunks = completed_chunks.clone();
+                let start_time = start_time;
+                let expected_hash = expected_hashes
+                    .and_then(|hashes| hashes.get(index))
+                    .map(|s| s.to_owned());
 
-                // Verify 206 Partial Content response
-                if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-                    return Err(format!(
-                        "Chunk {} request failed: expected 206 Partial Content, got {}",
+                let handle = tokio::spawn(async move {
+                    let chunk_start_time = Instant::now();
+
+                    let _permit = semaphore
+                        .acquire()
+                        .await
+                        .map_err(|e| format!("Failed to acquire semaphore: {}", e))?;
+
+                    tracing::debug!(
+                        "Downloading chunk {} (bytes {}-{}) from {}",
                         index,
-                        response.status()
-                    ));
-                }
+                        start,
+                        end,
+                        url
+                    );
 
-                // Read chunk data
-                let data = response
-                    .bytes()
+                    let mut request = client
+                        .get(&url)
+                        .header("Range", format!("bytes={}-{}", start, end));
+
+                    if let Some(ref peer_id) = downloader_peer_id {
+                        request = request.header("X-Downloader-Peer-ID", peer_id);
+                    }
+
+                    let response = request
+                        .send()
+                        .await
+                        .map_err(|e| format!("Failed to download chunk {}: {}", index, e))?;
+
+                    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+                        return Err(format!(
+                            "Chunk {} request failed: expected 206 Partial Content, got {}",
+                            index,
+                            response.status()
+                        ));
+                    }
+
+                    let data = response
+                        .bytes()
+                        .await
+                        .map_err(|e| format!("Failed to read chunk {} data: {}", index, e))?
+                        .to_vec();
+
+                    let expected_size = (end - start + 1) as usize;
+                    if data.len() != expected_size {
+                        return Err(format!(
+                            "Chunk {} size mismatch: expected {}, got {}",
+                            index,
+                            expected_size,
+                            data.len()
+                        ));
+                    }
+
+                    if let Some(expected_hash) = expected_hash {
+                        let mut hasher = Sha256::new();
+                        hasher.update(&data);
+                        let actual = hex::encode(hasher.finalize());
+                        if !actual.eq_ignore_ascii_case(expected_hash.trim()) {
+                            return Err(format!("HASH_MISMATCH:{}:{}", index, actual));
+                        }
+                    }
+
+                    let chunk_duration_ms = chunk_start_time.elapsed().as_millis() as u64;
+
+                    Ok::<(usize, Vec<u8>, u64), String>((index, data, chunk_duration_ms))
+                });
+
+                handles.push(handle);
+            }
+
+            for handle in handles {
+                let result = handle
                     .await
-                    .map_err(|e| format!("Failed to read chunk {} data: {}", index, e))?
-                    .to_vec();
+                    .map_err(|e| format!("Download task failed: {}", e))?;
 
-                let expected_size = (end - start + 1) as usize;
-                if data.len() != expected_size {
-                    return Err(format!(
-                        "Chunk {} size mismatch: expected {}, got {}",
-                        index,
-                        expected_size,
-                        data.len()
-                    ));
-                }
+                match result {
+                    Ok((index, data, duration_ms)) => {
+                        let chunk_size = data.len() as u64;
+                        let new_bytes =
+                            completed_bytes.fetch_add(chunk_size, Ordering::SeqCst) + chunk_size;
+                        let new_chunks = completed_chunks.fetch_add(1, Ordering::SeqCst) + 1;
 
-                let chunk_duration_ms = chunk_start_time.elapsed().as_millis() as u64;
-                let chunk_size = data.len() as u64;
+                        if let Some(ref bus) = event_bus {
+                            bus.emit_chunk_completed(ChunkCompletedEvent {
+                                transfer_id: config.transfer_id.clone(),
+                                chunk_id: index as u32,
+                                chunk_size: data.len(),
+                                source_id: source_id.clone(),
+                                source_type: SourceType::Http,
+                                completed_at: current_timestamp_ms(),
+                                download_duration_ms: duration_ms,
+                                verified: true,
+                            });
 
-                // Update atomic counters
-                let new_bytes = completed_bytes.fetch_add(chunk_size, Ordering::SeqCst) + chunk_size;
-                let new_chunks = completed_chunks.fetch_add(1, Ordering::SeqCst) + 1;
+                            if new_chunks % 5 == 0 || new_chunks as usize == ranges.len() {
+                                let elapsed_secs = start_time.elapsed().as_secs_f64();
+                                let speed = if elapsed_secs > 0.0 {
+                                    new_bytes as f64 / elapsed_secs
+                                } else {
+                                    0.0
+                                };
+                                let remaining = file_size.saturating_sub(new_bytes);
+                                let eta = calculate_eta(remaining, speed);
 
-                tracing::debug!("Downloaded chunk {} ({} bytes in {} ms)", index, data.len(), chunk_duration_ms);
+                                bus.emit_progress(TransferProgressEvent {
+                                    transfer_id: config.transfer_id.clone(),
+                                    downloaded_bytes: new_bytes,
+                                    total_bytes: file_size,
+                                    completed_chunks: new_chunks as u32,
+                                    total_chunks: ranges.len() as u32,
+                                    progress_percentage: calculate_progress(new_bytes, file_size),
+                                    download_speed_bps: speed,
+                                    upload_speed_bps: 0.0,
+                                    eta_seconds: eta,
+                                    active_sources: 1,
+                                    timestamp: current_timestamp_ms(),
+                                });
+                            }
+                        }
 
-                // Emit chunk completed event
-                if let Some(ref bus) = event_bus {
-                    bus.emit_chunk_completed(ChunkCompletedEvent {
-                        transfer_id: config.transfer_id.clone(),
-                        chunk_id: index as u32,
-                        chunk_size: data.len(),
-                        source_id: source_id.clone(),
-                        source_type: SourceType::Http,
-                        completed_at: current_timestamp_ms(),
-                        download_duration_ms: chunk_duration_ms,
-                        verified: true,
-                    });
+                        if let Some(tx) = &progress_tx {
+                            let _ = tx
+                                .send(HttpDownloadProgress {
+                                    file_hash: file_hash.to_string(),
+                                    chunks_total: ranges.len(),
+                                    chunks_downloaded: new_chunks as usize,
+                                    bytes_downloaded: new_bytes,
+                                    bytes_total: file_size,
+                                    status: DownloadStatus::Downloading,
+                                })
+                                .await;
+                        }
 
-                    // Emit progress event (every few chunks to avoid flooding)
-                    if new_chunks % 5 == 0 || new_chunks as usize == total_chunks {
-                        let elapsed_secs = start_time.elapsed().as_secs_f64();
-                        let speed = if elapsed_secs > 0.0 {
-                            new_bytes as f64 / elapsed_secs
-                        } else {
-                            0.0
-                        };
-                        let remaining = file_size.saturating_sub(new_bytes);
-                        let eta = calculate_eta(remaining, speed);
+                        results.insert(index, (data, duration_ms));
+                    }
+                    Err(err) => {
+                        if let Some(rest) = err.strip_prefix("HASH_MISMATCH:") {
+                            let mut parts = rest.splitn(2, ':');
+                            let index: usize = parts
+                                .next()
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or_default();
+                            let actual = parts.next().unwrap_or("unknown");
 
-                        bus.emit_progress(TransferProgressEvent {
-                            transfer_id: config.transfer_id.clone(),
-                            downloaded_bytes: new_bytes,
-                            total_bytes: file_size,
-                            completed_chunks: new_chunks as u32,
-                            total_chunks: total_chunks as u32,
-                            progress_percentage: calculate_progress(new_bytes, file_size),
-                            download_speed_bps: speed,
-                            upload_speed_bps: 0.0,
-                            eta_seconds: eta,
-                            active_sources: 1,
-                            timestamp: current_timestamp_ms(),
-                        });
+                            let expected = expected_hashes
+                                .and_then(|h| h.get(index))
+                                .cloned()
+                                .unwrap_or_else(|| "unknown".to_string());
+                            let error_msg = format!(
+                                "Chunk {} hash mismatch: expected {}, got {}",
+                                index, expected, actual
+                            );
+
+                            if let Some(ref bus) = event_bus {
+                                bus.emit_chunk_failed(ChunkFailedEvent {
+                                    transfer_id: config.transfer_id.clone(),
+                                    chunk_id: index as u32,
+                                    source_id: source_id.clone(),
+                                    source_type: SourceType::Http,
+                                    failed_at: current_timestamp_ms(),
+                                    error: error_msg.clone(),
+                                    retry_count: *attempts.get(&index).unwrap_or(&0) as u32,
+                                    will_retry: true,
+                                    next_retry_at: None,
+                                });
+                            }
+
+                            let entry = attempts.entry(index).or_insert(0);
+                            *entry += 1;
+                            if *entry <= 1 {
+                                if let Some(range) = range_lookup.get(&index) {
+                                    pending.push_back(range.clone());
+                                    continue;
+                                }
+                            }
+
+                            return Err(error_msg);
+                        }
+
+                        return Err(err);
                     }
                 }
-
-                // Send legacy progress update
-                if let Some(tx) = progress_tx {
-                    let _ = tx
-                        .send(HttpDownloadProgress {
-                            file_hash: file_hash.clone(),
-                            chunks_total: total_chunks,
-                            chunks_downloaded: new_chunks as usize,
-                            bytes_downloaded: new_bytes,
-                            bytes_total: file_size,
-                            status: DownloadStatus::Downloading,
-                        })
-                        .await;
-                }
-
-                Ok::<(usize, Vec<u8>), String>((index, data))
-            });
-
-            tasks.push(task);
+            }
         }
 
-        tracing::info!(
-            "Downloading {} chunks with max {} concurrent downloads",
-            ranges.len(),
-            MAX_CONCURRENT_CHUNKS
-        );
-
-        // Wait for all chunks to download
-        let mut results = Vec::new();
-        for task in tasks {
-            let result = task
-                .await
-                .map_err(|e| format!("Download task failed: {}", e))??;
-            results.push(result);
+        let mut ordered = Vec::new();
+        for idx in 0..ranges.len() {
+            if let Some((data, _)) = results.remove(&idx) {
+                ordered.push(data);
+            } else {
+                return Err(format!("Missing chunk {} after download", idx));
+            }
         }
 
-        // Sort by chunk index
-        results.sort_by_key(|(index, _)| *index);
-
-        // Extract just the data (drop indices)
-        let chunks: Vec<Vec<u8>> = results.into_iter().map(|(_, data)| data).collect();
-
-        Ok(chunks)
+        Ok(ordered)
     }
 
     /// Fetch file metadata from seeder
@@ -767,7 +851,7 @@ impl HttpDownloadClient {
 
         // Build request with optional peer ID header
         let mut request = self.http_client.get(&url);
-        
+
         if let Some(ref peer_id) = self.downloader_peer_id {
             request = request.header("X-Downloader-Peer-ID", peer_id);
             tracing::debug!("📤 Adding downloader peer ID header: {}", peer_id);
@@ -780,11 +864,7 @@ impl HttpDownloadClient {
         })?;
 
         if !response.status().is_success() {
-            let err_msg = format!(
-                "Metadata request failed: {} ({})",
-                response.status(),
-                url
-            );
+            let err_msg = format!("Metadata request failed: {} ({})", response.status(), url);
             tracing::error!("{}", err_msg);
             return Err(err_msg);
         }
@@ -851,129 +931,33 @@ impl HttpDownloadClient {
         ranges: &[ByteRange],
         progress_tx: Option<mpsc::Sender<HttpDownloadProgress>>,
         file_size: u64,
+        expected_hashes: Option<&[String]>,
     ) -> Result<Vec<Vec<u8>>, String> {
-        let mut tasks = Vec::new();
+        let config = HttpDownloadConfig {
+            transfer_id: file_hash.to_string(),
+            file_name: file_hash.to_string(),
+            priority: TransferPriority::High,
+        };
 
-        for range in ranges {
-            let client = self.http_client.clone();
-            let url = format!("{}/files/{}", seeder_url, file_hash);
-            let start = range.start;
-            let end = range.end;
-            let index = range.index;
-            let progress_tx = progress_tx.clone();
-            let file_hash = file_hash.to_string();
-            let total_chunks = ranges.len();
-            let semaphore = self.download_semaphore.clone();
-            let downloader_peer_id = self.downloader_peer_id.clone();
-
-            // Spawn task for each chunk (but semaphore limits concurrency)
-            let task = tokio::spawn(async move {
-                // Acquire permit (waits if MAX_CONCURRENT_CHUNKS already downloading)
-                let _permit = semaphore
-                    .acquire()
-                    .await
-                    .map_err(|e| format!("Failed to acquire semaphore: {}", e))?;
-
-                tracing::debug!(
-                    "Downloading chunk {} (bytes {}-{}) from {}",
-                    index,
-                    start,
-                    end,
-                    url
-                );
-
-                // Make request with Range header and optional peer ID
-                let mut request = client
-                    .get(&url)
-                    .header("Range", format!("bytes={}-{}", start, end));
-                
-                if let Some(ref peer_id) = downloader_peer_id {
-                    request = request.header("X-Downloader-Peer-ID", peer_id);
-                }
-                
-                let response = request.send().await.map_err(|e| format!("Failed to download chunk {}: {}", index, e))?;
-
-                // Verify 206 Partial Content response
-                if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-                    return Err(format!(
-                        "Chunk {} request failed: expected 206 Partial Content, got {}",
-                        index,
-                        response.status()
-                    ));
-                }
-
-                // Read chunk data
-                let data = response
-                    .bytes()
-                    .await
-                    .map_err(|e| format!("Failed to read chunk {} data: {}", index, e))?
-                    .to_vec();
-
-                let expected_size = (end - start + 1) as usize;
-                if data.len() != expected_size {
-                    return Err(format!(
-                        "Chunk {} size mismatch: expected {}, got {}",
-                        index,
-                        expected_size,
-                        data.len()
-                    ));
-                }
-
-                tracing::debug!("Downloaded chunk {} ({} bytes)", index, data.len());
-
-                // Send progress update
-                if let Some(tx) = progress_tx {
-                    let _ = tx
-                        .send(HttpDownloadProgress {
-                            file_hash: file_hash.clone(),
-                            chunks_total: total_chunks,
-                            chunks_downloaded: index + 1,
-                            bytes_downloaded: data.len() as u64,
-                            bytes_total: file_size,
-                            status: DownloadStatus::Downloading,
-                        })
-                        .await;
-                }
-
-                Ok::<(usize, Vec<u8>), String>((index, data))
-                // Permit automatically released when _permit is dropped
-            });
-
-            tasks.push(task);
-        }
-
-        tracing::info!(
-            "Downloading {} chunks with max {} concurrent downloads",
-            ranges.len(),
-            MAX_CONCURRENT_CHUNKS
-        );
-
-        // Wait for all chunks to download
-        let mut results = Vec::new();
-        for task in tasks {
-            let result = task
-                .await
-                .map_err(|e| format!("Download task failed: {}", e))??;
-            results.push(result);
-        }
-
-        // Sort by chunk index
-        results.sort_by_key(|(index, _)| *index);
-
-        // Extract just the data (drop indices)
-        let chunks: Vec<Vec<u8>> = results.into_iter().map(|(_, data)| data).collect();
-
-        Ok(chunks)
+        self.download_chunks_with_events(
+            seeder_url,
+            file_hash,
+            ranges,
+            progress_tx,
+            file_size,
+            &config,
+            None,
+            seeder_url,
+            Instant::now(),
+            expected_hashes,
+        )
+        .await
     }
 
     /// Assemble chunks into final file
     ///
     /// Writes chunks sequentially to the output file
-    async fn assemble_file(
-        &self,
-        chunks: &[Vec<u8>],
-        output_path: &Path,
-    ) -> Result<(), String> {
+    async fn assemble_file(&self, chunks: &[Vec<u8>], output_path: &Path) -> Result<(), String> {
         // Ensure parent directory exists
         if let Some(parent) = output_path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -983,24 +967,34 @@ impl HttpDownloadClient {
 
         tracing::info!("Creating output file: {}", output_path.display());
 
-        let mut file = File::create(output_path)
-            .await
-            .map_err(|e| format!("Failed to create output file at {}: {}", output_path.display(), e))?;
+        let mut file = File::create(output_path).await.map_err(|e| {
+            format!(
+                "Failed to create output file at {}: {}",
+                output_path.display(),
+                e
+            )
+        })?;
 
         tracing::info!("Writing {} chunks to file...", chunks.len());
 
         for (index, chunk) in chunks.iter().enumerate() {
-            file.write_all(chunk)
-                .await
-                .map_err(|e| format!("Failed to write chunk {} to {}: {}", index, output_path.display(), e))?;
+            file.write_all(chunk).await.map_err(|e| {
+                format!(
+                    "Failed to write chunk {} to {}: {}",
+                    index,
+                    output_path.display(),
+                    e
+                )
+            })?;
         }
 
         file.flush()
             .await
             .map_err(|e| format!("Failed to flush file {}: {}", output_path.display(), e))?;
 
-        tracing::info!("Successfully assembled file: {} ({} chunks, {} bytes)", 
-            output_path.display(), 
+        tracing::info!(
+            "Successfully assembled file: {} ({} chunks, {} bytes)",
+            output_path.display(),
             chunks.len(),
             chunks.iter().map(|c| c.len()).sum::<usize>()
         );
@@ -1033,7 +1027,6 @@ impl HttpDownloadClient {
         }
     }
 
-
     /// Resume a download from a specific byte offset using Range requests
     ///
     /// This method downloads the remaining part of a file starting from `bytes_already_downloaded`
@@ -1060,14 +1053,16 @@ impl HttpDownloadClient {
         if remaining_bytes == 0 {
             // Already complete
             if let Some(tx) = progress_tx {
-                let _ = tx.send(HttpDownloadProgress {
-                    file_hash: file_hash.to_string(),
-                    chunks_total: (total_size / CHUNK_SIZE) as usize,
-                    chunks_downloaded: (total_size / CHUNK_SIZE) as usize,
-                    bytes_downloaded: total_size,
-                    bytes_total: total_size,
-                    status: DownloadStatus::Completed,
-                }).await;
+                let _ = tx
+                    .send(HttpDownloadProgress {
+                        file_hash: file_hash.to_string(),
+                        chunks_total: (total_size / CHUNK_SIZE) as usize,
+                        chunks_downloaded: (total_size / CHUNK_SIZE) as usize,
+                        bytes_downloaded: total_size,
+                        bytes_total: total_size,
+                        status: DownloadStatus::Completed,
+                    })
+                    .await;
             }
             return Ok(());
         }
@@ -1093,7 +1088,8 @@ impl HttpDownloadClient {
             bytes_already_downloaded,
             total_size,
             DownloadStatus::Downloading,
-        ).await;
+        )
+        .await;
 
         // Download remaining chunks
         let chunks = self
@@ -1103,12 +1099,14 @@ impl HttpDownloadClient {
                 &ranges,
                 progress_tx.clone(),
                 total_size,
+                None,
             )
             .await?;
 
         // Write chunks to file in order
         for chunk in chunks {
-            file.write_all(&chunk).await
+            file.write_all(&chunk)
+                .await
                 .map_err(|e| format!("Failed to write chunk to file: {}", e))?;
         }
 
@@ -1121,7 +1119,8 @@ impl HttpDownloadClient {
             total_size,
             total_size,
             DownloadStatus::Completed,
-        ).await;
+        )
+        .await;
 
         tracing::info!("Successfully resumed download: {}", file_hash);
         Ok(())
@@ -1146,7 +1145,6 @@ impl HttpDownloadClient {
 
         ranges
     }
-
 }
 
 #[cfg(test)]

@@ -1,9 +1,11 @@
 // Note: Read trait is used in closure within try_download_range_blocking
+use hex;
+use sha2::{Digest, Sha256};
 #[allow(unused_imports)]
 use std::io::Read;
 use std::time::Duration;
-use suppaftp::{FtpError, FtpStream};
 use suppaftp::types::FileType;
+use suppaftp::{FtpError, FtpStream};
 use tokio::task;
 use tracing::{debug, info, warn};
 use url::Url;
@@ -26,7 +28,7 @@ impl Default for FtpDownloadConfig {
         Self {
             timeout_secs: 30,
             max_retries: 3,
-            passive_mode: true,  // Passive mode works better behind NAT
+            passive_mode: true, // Passive mode works better behind NAT
             connection_pool_size: 5,
         }
     }
@@ -219,11 +221,8 @@ impl FtpDownloader {
             match Self::try_download_range_blocking(stream, remote_path, start_byte, size) {
                 Ok(data) => {
                     if data.len() != size as usize {
-                        last_error = format!(
-                            "Size mismatch: expected {} bytes, got {}",
-                            size,
-                            data.len()
-                        );
+                        last_error =
+                            format!("Size mismatch: expected {} bytes, got {}", size, data.len());
                         warn!("Attempt {}/{}: {}", attempt, max_retries, last_error);
 
                         if attempt < max_retries {
@@ -256,6 +255,34 @@ impl FtpDownloader {
         ))
     }
 
+    /// Download a range and verify against an expected SHA-256 hash when provided
+    pub async fn download_range_with_hash(
+        &self,
+        stream: &mut FtpStream,
+        remote_path: &str,
+        start_byte: u64,
+        size: u64,
+        expected_sha256: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
+        let data = self
+            .download_range(stream, remote_path, start_byte, size)
+            .await?;
+
+        if let Some(expected) = expected_sha256 {
+            let mut hasher = Sha256::new();
+            hasher.update(&data);
+            let actual = hex::encode(hasher.finalize());
+            if !actual.eq_ignore_ascii_case(expected.trim()) {
+                return Err(format!(
+                    "Hash mismatch for FTP range starting at {}: expected {}, got {}",
+                    start_byte, expected, actual
+                ));
+            }
+        }
+
+        Ok(data)
+    }
+
     /// Blocking implementation of range download (called from spawn_blocking)
     fn try_download_range_blocking(
         stream: &mut FtpStream,
@@ -266,7 +293,10 @@ impl FtpDownloader {
         // Send REST command to set starting position (if supported by suppaftp 6.x)
         // Note: suppaftp 6.x may not have rest() method, so we rely on RETR with offset
 
-        debug!("Attempting to download {} bytes from offset {}", size, start_byte);
+        debug!(
+            "Attempting to download {} bytes from offset {}",
+            size, start_byte
+        );
 
         // Use RETR command with a closure to read data
         // suppaftp v6 API: retr(file_name, reader_fn)
@@ -287,9 +317,14 @@ impl FtpDownloader {
                     while skipped < start_byte {
                         let to_skip = std::cmp::min(8192, (start_byte - skipped) as usize);
                         match reader.read(&mut skip_buf[..to_skip]) {
-                            Ok(0) => break,  // EOF
+                            Ok(0) => break, // EOF
                             Ok(n) => skipped += n as u64,
-                            Err(e) => return Err(FtpError::ConnectionError(std::io::Error::new(std::io::ErrorKind::Other, format!("Skip error: {}", e)))),
+                            Err(e) => {
+                                return Err(FtpError::ConnectionError(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    format!("Skip error: {}", e),
+                                )))
+                            }
                         }
                     }
 
@@ -377,7 +412,7 @@ impl FtpDownloader {
 
                 loop {
                     match reader.read(&mut temp_buf) {
-                        Ok(0) => break,  // EOF
+                        Ok(0) => break, // EOF
                         Ok(n) => buf.extend_from_slice(&temp_buf[..n]),
                         Err(e) => return Err(FtpError::ConnectionError(e)),
                     }
@@ -422,17 +457,17 @@ impl FtpDownloader {
             .nlst(Some(&path_clone))
             .map_err(|e| format!("NLST command failed: {}", e))?;
 
-        info!("Found {} entries in directory {}", entries.len(), path_clone);
+        info!(
+            "Found {} entries in directory {}",
+            entries.len(),
+            path_clone
+        );
 
         Ok(entries)
     }
 
     /// Change working directory
-    pub async fn change_directory(
-        &self,
-        stream: &mut FtpStream,
-        path: &str,
-    ) -> Result<(), String> {
+    pub async fn change_directory(&self, stream: &mut FtpStream, path: &str) -> Result<(), String> {
         let path_clone = path.to_string();
         debug!("Changing directory to: {}", path_clone);
 
@@ -702,7 +737,12 @@ mod tests {
                 .await
             {
                 Ok(data) => {
-                    println!("Downloaded range {}-{}: {} bytes", start, start + size, data.len());
+                    println!(
+                        "Downloaded range {}-{}: {} bytes",
+                        start,
+                        start + size,
+                        data.len()
+                    );
                     chunks.push(data);
                 }
                 Err(e) => {
