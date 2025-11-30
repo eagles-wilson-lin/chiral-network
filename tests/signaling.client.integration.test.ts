@@ -1,13 +1,19 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { SignalingService } from "../src/lib/services/signalingService";
-import { spawn } from "child_process";
+import { spawn, ChildProcess } from "child_process";
 import path from "path";
 import { WebSocket } from "ws";
+
+// Type definition for globalThis with WebSocket
+declare global {
+  // eslint-disable-next-line no-var
+  var WebSocket: typeof WebSocket | undefined;
+}
 
 // Polyfill WebSocket for Node.js environment
 beforeAll(() => {
   if (typeof globalThis.WebSocket === 'undefined') {
-    (globalThis as any).WebSocket = WebSocket;
+    globalThis.WebSocket = WebSocket as unknown as typeof globalThis.WebSocket;
   }
 });
 
@@ -17,7 +23,7 @@ function wait(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function startServer(port: number = 9000): Promise<any> {
+async function startServer(port: number = 9000): Promise<ChildProcess> {
   const node = spawn(process.execPath, [SERVER_PATH], {
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, PORT: port.toString(), HOST: "127.0.0.1" },
@@ -37,7 +43,7 @@ async function startServer(port: number = 9000): Promise<any> {
       if (s.includes("SignalingServer] listening")) {
         clearTimeout(timeout);
         node.stdout.off("data", onData);
-        node.removeListener("exit", onExit as any);
+        node.removeListener("exit", onExit);
         resolve();
       }
     };
@@ -46,14 +52,14 @@ async function startServer(port: number = 9000): Promise<any> {
       node.stdout.off("data", onData);
       reject(new Error("server process exited before ready: " + code));
     };
-    node.on("exit", onExit as any);
+    node.on("exit", onExit);
     node.stdout.on("data", onData);
   });
 
   return node;
 }
 
-async function stopServer(node: any): Promise<void> {
+async function stopServer(node: ChildProcess): Promise<void> {
   return new Promise((resolve) => {
     node.on("exit", () => resolve());
     node.kill();

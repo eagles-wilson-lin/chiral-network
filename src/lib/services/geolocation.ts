@@ -73,7 +73,7 @@ function inferRegionFromTimezone(timezone: string): GeoRegionConfig | null {
     // EU Central - Central and Eastern European timezones
     {
       test: (value) =>
-        /europe\/(berlin|vienna|warsaw|prague|budapest|zurich|amsterdam|brussels|stockholm|oslo|copenhagen|rome|madrid|paris|prague|bucharest|sofia|athens|helsinki|tallinn|riga|vilnius|belgrade|zagreb|ljubljana|sarajevo|skopje|kiev|moscow|minsk)/.test(
+        /europe\/(berlin|vienna|warsaw|prague|budapest|zurich|amsterdam|brussels|stockholm|oslo|copenhagen|rome|madrid|paris|bucharest|sofia|athens|helsinki|tallinn|riga|vilnius|belgrade|zagreb|ljubljana|sarajevo|skopje|kiev|moscow|minsk)/.test(
           value
         ),
       regionId: 'euCentral',
