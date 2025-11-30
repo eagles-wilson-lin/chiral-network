@@ -409,7 +409,7 @@
       {
         id: 'http',
         name: 'HTTP',
-        description: 'Direct HTTP/FTP download',
+        description: 'Direct HTTP download (falls back to FTP mirror)',
         available: !!(metadata.httpSources && metadata.httpSources.length > 0) || !!(metadata.ftpSources && metadata.ftpSources.length > 0)
       },
       {
@@ -502,7 +502,8 @@
     try {
       const { invoke } = await import("@tauri-apps/api/core");
 
-      if (protocolId === 'http' && metadata.httpSources && metadata.httpSources.length > 0) {
+    if (protocolId === 'http') {
+      if (metadata.httpSources && metadata.httpSources.length > 0) {
         await invoke('download_file_http', {
           seeder_url: metadata.httpSources[0],
           merkle_root: metadata.merkleRoot || metadata.fileHash,
@@ -510,9 +511,15 @@
           peer_id: null
         });
         pushMessage('HTTP download started', 'success');
-      } else if (protocolId === 'ftp' && metadata.ftpSources && metadata.ftpSources.length > 0) {
+      } else if (metadata.ftpSources && metadata.ftpSources.length > 0) {
         await invoke('download_ftp', { url: metadata.ftpSources[0] });
-        pushMessage('FTP download started', 'success');
+        pushMessage('No HTTP mirror detected. Falling back to FTP.', 'info');
+      } else {
+        pushMessage('No HTTP or FTP mirrors available for this file', 'warning');
+      }
+    } else if (protocolId === 'ftp' && metadata.ftpSources && metadata.ftpSources.length > 0) {
+      await invoke('download_ftp', { url: metadata.ftpSources[0] });
+      pushMessage('FTP download started', 'success');
       } else if (protocolId === 'ed2k' && metadata.ed2kSources && metadata.ed2kSources.length > 0) {
         await invoke('download_ed2k', { link: metadata.ed2kSources[0] });
         pushMessage('ED2K download started', 'success');

@@ -113,6 +113,31 @@
   // Check if user is already seeding this file
   $: isSeeding = !!get(files).find(f => f.hash === metadata.fileHash && f.status === 'seeding');
 
+  // Source availability and fallback messaging
+  // These labels are not surfaced elsewhere; the protocol badges only show that
+  // an option exists. We expose the scheduler's P2P → HTTP → FTP priority here
+  // so users understand which mirror is currently preferred and what the
+  // automatic fallback chain looks like.
+  $: p2pSourceCount = metadata?.seeders?.length ?? 0;
+  $: httpSourceCount = metadata?.httpSources?.length ?? 0;
+  $: ftpSourceCount = metadata?.ftpSources?.length ?? 0;
+
+  $: activeSourceLabel = p2pSourceCount > 0
+    ? 'P2P peers (preferred)'
+    : httpSourceCount > 0
+      ? 'HTTP mirror'
+      : ftpSourceCount > 0
+        ? 'FTP mirror'
+        : 'Unavailable';
+
+  $: fallbackLabel = p2pSourceCount > 0
+    ? 'Preferring peers for speed. Will fall back to HTTP then FTP mirrors if peers disappear.'
+    : httpSourceCount > 0
+      ? 'No peers online. Falling back to HTTP mirror with FTP as backup.'
+      : ftpSourceCount > 0
+        ? 'No peers or HTTP mirrors detected. Using FTP mirror as fallback.'
+        : 'No alternative mirrors available.';
+
   function copyHash() {
     navigator.clipboard.writeText(metadata.fileHash).then(() => {
       hashCopied = true;
@@ -332,6 +357,22 @@
         </Badge>
       {/each}
     </div>
+  </div>
+
+  <div class="rounded-md border border-dashed border-border/70 bg-muted/40 p-4 space-y-2">
+    <div class="flex items-center justify-between gap-3 flex-wrap">
+      <div>
+        <p class="text-xs uppercase tracking-wide text-muted-foreground">Active source</p>
+        <p class="text-sm font-medium">{activeSourceLabel}</p>
+        <p class="text-xs text-muted-foreground">{fallbackLabel}</p>
+      </div>
+      <div class="flex items-center gap-2 flex-wrap">
+        <Badge variant="outline">P2P: {p2pSourceCount}</Badge>
+        <Badge variant="outline">HTTP: {httpSourceCount}</Badge>
+        <Badge variant="outline">FTP: {ftpSourceCount}</Badge>
+      </div>
+    </div>
+    <p class="text-xs text-muted-foreground">Priority: P2P &gt; HTTP &gt; FTP</p>
   </div>
 
   <div class="grid gap-4 md:grid-cols-2">

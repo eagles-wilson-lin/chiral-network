@@ -260,26 +260,148 @@ impl DownloadScheduler {
                 .map_err(|e| format!("Failed to create download directory: {}", e))?;
         }
 
-        // Spawn async task to download file
+        // Spawn async task to download file. FTPS still uses the basic client, while plain
+        // FTP leverages the skip-and-read range logic from `ftp_downloader` so we can
+        // request specific byte windows without REST support.
         let info_clone = info.clone();
         let output_path_clone = output_path.clone();
 
         tokio::spawn(async move {
-            match ftp_client::download_from_ftp(&info_clone, &output_path_clone).await {
-                Ok(bytes) => {
-                    info!(
-                        bytes = bytes,
-                        output = ?output_path_clone,
-                        "FTP download completed successfully"
-                    );
+            if info_clone.use_ftps {
+                match ftp_client::download_from_ftp(&info_clone, &output_path_clone).await {
+                    Ok(bytes) => {
+                        info!(
+                            bytes = bytes,
+                            output = ?output_path_clone,
+                            "FTP download completed successfully"
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            url = %info_clone.url,
+                            "FTP download failed"
+                        );
+                    }
                 }
+                return;
+            }
+
+            use crate::ftp_downloader::{FtpCredentials, FtpDownloadConfig, FtpDownloader};
+            use std::io::{Seek, SeekFrom, Write};
+            use url::Url;
+
+            let parsed_url = match Url::parse(&info_clone.url) {
+                Ok(url) => url,
+                Err(e) => {
+                    error!(error = %e, url = %info_clone.url, "Invalid FTP URL");
+                    return;
+                }
+            };
+
+            let mut config = FtpDownloadConfig::default();
+            config.passive_mode = info_clone.passive_mode;
+            if let Some(timeout) = info_clone.timeout_secs {
+                config.timeout_secs = timeout;
+            }
+
+            let downloader = FtpDownloader::with_config(config);
+            let credentials = info_clone.username.as_ref().map(|username| {
+                FtpCredentials::new(
+                    username.clone(),
+                    info_clone
+                        .encrypted_password
+                        .clone()
+                        .unwrap_or_else(|| "".to_string()),
+                )
+            });
+
+            let mut stream = match downloader
+                .connect_and_login(&parsed_url, credentials.or(Some(FtpCredentials::anonymous())))
+                .await
+            {
+                Ok(stream) => stream,
+                Err(e) => {
+                    error!(error = %e, url = %info_clone.url, "FTP connection failed");
+                    return;
+                }
+            };
+
+            let remote_path = parsed_url.path().to_string();
+            let file_size = match downloader.get_file_size(&mut stream, &remote_path).await {
+                Ok(size) => size,
                 Err(e) => {
                     error!(
                         error = %e,
                         url = %info_clone.url,
-                        "FTP download failed"
+                        "Unable to determine FTP file size"
                     );
+                    return;
                 }
+            };
+
+            let mut file = match std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&output_path_clone)
+            {
+                Ok(file) => file,
+                Err(e) => {
+                    error!(error = %e, output = ?output_path_clone, "Failed to open output file");
+                    return;
+                }
+            };
+
+            let mut offset = 0u64;
+            let chunk_size: u64 = 1_048_576; // 1MB
+
+            while offset < file_size {
+                let size = std::cmp::min(chunk_size, file_size - offset);
+                match downloader
+                    .download_range(&mut stream, &remote_path, offset, size)
+                    .await
+                {
+                    Ok(data) => {
+                        if let Err(e) = file.seek(SeekFrom::Start(offset)) {
+                            error!(error = %e, offset, "Failed to seek output file");
+                            break;
+                        }
+
+                        if let Err(e) = file.write_all(&data) {
+                            error!(error = %e, offset, "Failed to write FTP data to disk");
+                            break;
+                        }
+
+                        offset += data.len() as u64;
+                        debug!(
+                            downloaded = offset,
+                            total = file_size,
+                            "Wrote FTP chunk using skip-read range logic"
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            offset,
+                            size,
+                            "FTP range download failed"
+                        );
+                        break;
+                    }
+                }
+            }
+
+            if let Err(e) = downloader.disconnect(&mut stream).await {
+                warn!(error = %e, "FTP disconnect encountered an error");
+            }
+
+            if offset >= file_size {
+                info!(
+                    bytes = offset,
+                    output = ?output_path_clone,
+                    "FTP download completed successfully"
+                );
             }
         });
 
