@@ -47,37 +47,112 @@ function nearestRegion(lat: number, lng: number): GeoRegionConfig {
 function inferRegionFromTimezone(timezone: string): GeoRegionConfig | null {
   const tz = timezone.toLowerCase();
 
+  // Order matters - more specific matches should come before general ones
   const matchers: Array<{ test: (tz: string) => boolean; regionId: string }> = [
+    // US West - Pacific states and Mountain states
     {
       test: (value) =>
-        /america\/(los_angeles|vancouver|whitehorse|sitka|anchorage|metlakatla|juneau|yakutat|tijuana|phoenix|boise|denver|edmonton|dawson|hermosillo|mazatlan)/.test(
+        /america\/(los_angeles|vancouver|whitehorse|sitka|anchorage|metlakatla|juneau|yakutat|tijuana|phoenix|boise|denver|edmonton|dawson|hermosillo|mazatlan|yellowknife|dawson_creek)/.test(
           value
         ),
       regionId: 'usWest',
     },
+    // South America - must come before generic America matcher
+    {
+      test: (value) =>
+        /america\/(argentina|buenos_aires|santiago|sao_paulo|bogota|lima|la_paz|montevideo|caracas|asuncion|guayaquil|fortaleza|bahia|recife|belem|manaus|cuiaba|porto_velho|campo_grande|rio_branco|maceio|cayenne|paramaribo|bogota)/.test(
+          value
+        ),
+      regionId: 'southAmerica',
+    },
+    // US East and Central - general America catch-all for North American timezones
     {
       test: (value) => /america\//.test(value),
       regionId: 'usEast',
     },
+    // EU Central - Central and Eastern European timezones
     {
-      test: (value) => /europe\//.test(value),
+      test: (value) =>
+        /europe\/(berlin|vienna|warsaw|prague|budapest|zurich|amsterdam|brussels|stockholm|oslo|copenhagen|rome|madrid|paris|prague|bucharest|sofia|athens|helsinki|tallinn|riga|vilnius|belgrade|zagreb|ljubljana|sarajevo|skopje|kiev|moscow|minsk)/.test(
+          value
+        ),
+      regionId: 'euCentral',
+    },
+    // EU West - UK, Ireland, Portugal
+    {
+      test: (value) =>
+        /europe\/(london|dublin|lisbon|reykjavik|isle_of_man|jersey|guernsey)/.test(value),
       regionId: 'euWest',
     },
+    // EU catch-all (default to euCentral for unmatched European timezones)
     {
-      test: (value) => /(asia|indian)\//.test(value),
+      test: (value) => /europe\//.test(value),
+      regionId: 'euCentral',
+    },
+    // Asia East - Japan, Korea, China
+    {
+      test: (value) =>
+        /asia\/(tokyo|seoul|shanghai|chongqing|hong_kong|taipei|macau|harbin|urumqi|pyongyang)/.test(
+          value
+        ),
+      regionId: 'asiaEast',
+    },
+    // Asia Pacific - Southeast Asia, India
+    {
+      test: (value) =>
+        /asia\/(singapore|kuala_lumpur|jakarta|manila|ho_chi_minh|bangkok|yangon|phnom_penh|vientiane|calcutta|kolkata|mumbai|delhi|bangalore|chennai|kathmandu|dhaka|colombo|karachi|kabul|tehran|dubai|riyadh|bahrain|qatar|muscat|kuwait)/.test(
+          value
+        ),
       regionId: 'asiaPacific',
     },
+    // Indian Ocean timezones default to Asia Pacific
+    {
+      test: (value) => /indian\//.test(value),
+      regionId: 'asiaPacific',
+    },
+    // Asia catch-all
+    {
+      test: (value) => /asia\//.test(value),
+      regionId: 'asiaPacific',
+    },
+    // Oceania - Australia and Pacific
+    {
+      test: (value) =>
+        /(australia|pacific)\/(sydney|melbourne|brisbane|perth|adelaide|hobart|darwin|auckland|wellington|fiji|guam|port_moresby|noumea|tahiti|honolulu)/.test(
+          value
+        ),
+      regionId: 'oceania',
+    },
+    // Oceania catch-all
     {
       test: (value) => /(australia|pacific)\//.test(value),
       regionId: 'oceania',
     },
+    // Africa
+    {
+      test: (value) =>
+        /africa\/(cairo|johannesburg|lagos|nairobi|casablanca|algiers|tunis|accra|addis_ababa|khartoum|dar_es_salaam|kampala|harare|lusaka|maputo|kinshasa|luanda|windhoek|gaborone|cape_town)/.test(
+          value
+        ),
+      regionId: 'africa',
+    },
+    // Africa catch-all
     {
       test: (value) => /africa\//.test(value),
       regionId: 'africa',
     },
+    // Atlantic timezones - map to closest region
     {
-      test: (value) => /(america|south_america)\/(argentina|buenos_aires|santiago|sao_paulo|bogota|lima|la_paz|montevideo)/.test(value),
-      regionId: 'southAmerica',
+      test: (value) => /atlantic\/azores/.test(value),
+      regionId: 'euWest',
+    },
+    {
+      test: (value) => /atlantic\/bermuda/.test(value),
+      regionId: 'usEast',
+    },
+    {
+      test: (value) => /atlantic\//.test(value),
+      regionId: 'euWest',
     },
   ];
 

@@ -4,7 +4,9 @@ import path from "path";
 
 export default defineConfig({
   test: {
-    include: ["tests/**/*.{test,spec}.{js,mjs,cjs,ts,mts,cts,jsx,tsx}"],
+    include: ["tests/**/*.test.{js,mjs,cjs,ts,mts,cts,jsx,tsx}"],
+    // Exclude Playwright E2E tests (*.spec.ts files)
+    exclude: ["tests/**/*.spec.{js,mjs,cjs,ts,mts,cts,jsx,tsx}", "node_modules/**"],
     environment: "node",
     globals: true,
   },

@@ -8,8 +8,8 @@ import {
   type DhtConfig,
   type FileMetadata,
   type DhtHealth,
-  encryptionService,
 } from "../src/lib/dht";
+import { encryptionService } from "../src/lib/services/encryption";
 
 // Mock Tauri APIs
 vi.mock("@tauri-apps/api/core", () => ({
@@ -312,7 +312,8 @@ describe("dht.ts", () => {
         );
         expect(mockInvoke).toHaveBeenCalledWith("upload_file_to_network", {
           filePath: "/path/to/file.txt",
-          price: null,
+          price: 0,
+          protocol: "Bitswap",
         });
         expect(result).toEqual(mockFileMetadata);
       });
@@ -332,6 +333,7 @@ describe("dht.ts", () => {
         expect(mockInvoke).toHaveBeenCalledWith("upload_file_to_network", {
           filePath: "/path/to/file.txt",
           price: 100,
+          protocol: "Bitswap",
         });
       });
 
@@ -547,26 +549,8 @@ describe("dht.ts", () => {
       });
     });
 
-    describe("searchFileByCid", () => {
-      it("should search for file by CID", async () => {
-        dhtService.setPeerId("peer-cid");
-        mockInvoke.mockResolvedValueOnce(undefined);
-
-        await dhtService.searchFileByCid("QmTest123");
-
-        expect(mockInvoke).toHaveBeenCalledWith("search_file_by_cid", {
-          cidStr: "QmTest123",
-        });
-      });
-
-      it("should throw error if DHT not started", async () => {
-        dhtService.setPeerId(null);
-
-        await expect(dhtService.searchFileByCid("QmTest123")).rejects.toThrow(
-          "DHT not started"
-        );
-      });
-    });
+    // Note: searchFileByCid method was removed from DhtService
+    // Use searchFileMetadata instead for file searches by hash
 
     describe("connectPeer", () => {
       it("should connect to peer successfully", async () => {
@@ -845,7 +829,10 @@ describe("dht.ts", () => {
       it("should encrypt file and return manifest", async () => {
         const mockManifest = {
           merkleRoot: "root123",
-          chunks: [{ cid: "chunk1" }, { cid: "chunk2" }],
+          chunks: [
+            { index: 0, hash: "chunk1hash", size: 100, encryptedHash: "enc1", encryptedSize: 120 },
+            { index: 1, hash: "chunk2hash", size: 100, encryptedHash: "enc2", encryptedSize: 120 }
+          ],
           encryptedKeyBundle: '{"key":"encrypted"}',
         };
 
@@ -853,8 +840,26 @@ describe("dht.ts", () => {
 
         const result = await encryptionService.encryptFile("/path/to/file.txt");
 
-        expect(mockInvoke).toHaveBeenCalledWith("encrypt_file_for_upload", {
+        expect(mockInvoke).toHaveBeenCalledWith("encrypt_file_for_self_upload", {
           filePath: "/path/to/file.txt",
+        });
+        expect(result).toEqual(mockManifest);
+      });
+
+      it("should encrypt file for recipient", async () => {
+        const mockManifest = {
+          merkleRoot: "root456",
+          chunks: [],
+          encryptedKeyBundle: '{"key":"encrypted_for_recipient"}',
+        };
+
+        mockInvoke.mockResolvedValueOnce(mockManifest);
+
+        const result = await encryptionService.encryptFile("/path/to/file.txt", "recipient_public_key");
+
+        expect(mockInvoke).toHaveBeenCalledWith("encrypt_file_for_recipient", {
+          filePath: "/path/to/file.txt",
+          recipientPublicKey: "recipient_public_key",
         });
         expect(result).toEqual(mockManifest);
       });
@@ -1117,6 +1122,7 @@ describe("dht.ts", () => {
         expect(mockInvoke).toHaveBeenCalledWith("upload_file_to_network", {
           filePath: "/path/to/file.txt",
           price: 0,
+          protocol: "Bitswap",
         });
       });
     });
